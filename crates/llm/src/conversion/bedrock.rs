@@ -576,6 +576,7 @@ pub mod from_completions {
 								helpers::maybe_insert_cache_point(
 									&mut out,
 									text.prompt_cache_breakpoint.is_some(),
+									None,
 									cache_points_used,
 								);
 							}
@@ -588,6 +589,7 @@ pub mod from_completions {
 							helpers::maybe_insert_cache_point(
 								&mut out,
 								image.prompt_cache_breakpoint.is_some(),
+								None,
 								cache_points_used,
 							);
 						},
@@ -636,6 +638,7 @@ pub mod from_completions {
 									helpers::maybe_insert_cache_point(
 										&mut content,
 										text.prompt_cache_breakpoint.is_some(),
+										None,
 										cache_points_used,
 									);
 								}
@@ -719,7 +722,7 @@ pub mod from_completions {
 				status: None,
 			},
 		)];
-		helpers::maybe_insert_cache_point(&mut blocks, marked, cache_points_used);
+		helpers::maybe_insert_cache_point(&mut blocks, marked, None, cache_points_used);
 		blocks
 	}
 
@@ -823,7 +826,7 @@ pub mod from_completions {
 			let mut blocks = Vec::new();
 			for (text, marked) in &system_parts {
 				blocks.push(bedrock::SystemContentBlock::Text { text: text.clone() });
-				helpers::maybe_insert_cache_point(&mut blocks, *marked, &mut cache_points_used);
+				helpers::maybe_insert_cache_point(&mut blocks, *marked, None, &mut cache_points_used);
 			}
 			Some(blocks)
 		} else {
@@ -998,7 +1001,7 @@ pub mod from_completions {
 				};
 				if meets_minimum {
 					system_blocks.push(bedrock::SystemContentBlock::CachePoint {
-						cache_point: helpers::create_cache_point(),
+						cache_point: helpers::create_cache_point(None),
 					});
 					cache_points_used += 1;
 				}
@@ -1037,7 +1040,7 @@ pub mod from_completions {
 			{
 				tool_config
 					.tools
-					.push(bedrock::Tool::CachePoint(helpers::create_cache_point()));
+					.push(bedrock::Tool::CachePoint(helpers::create_cache_point(None)));
 			}
 		}
 		helpers::ensure_tool_config_for_history(&mut bedrock_request);
@@ -1489,6 +1492,7 @@ pub mod from_messages {
 						input_schema: Some(bedrock::ToolInputSchema::Json(tool.input_schema)),
 					}),
 					tool.cache_control.is_some(),
+					helpers::parse_cache_point_ttl(tool.cache_control.as_ref().and_then(|c| c.ttl())),
 				));
 			}
 
@@ -1549,6 +1553,7 @@ pub mod from_messages {
 								helpers::maybe_insert_cache_point(
 									&mut result,
 									cache_control.is_some(),
+									helpers::parse_cache_point_ttl(cache_control.as_ref().and_then(|c| c.ttl())),
 									&mut cache_points_used,
 								);
 							},
@@ -1578,6 +1583,7 @@ pub mod from_messages {
 							helpers::maybe_insert_cache_point(
 								system_content,
 								cache_control.is_some(),
+								helpers::parse_cache_point_ttl(cache_control.as_ref().and_then(|c| c.ttl())),
 								&mut cache_points_used,
 							);
 						}
@@ -1589,12 +1595,16 @@ pub mod from_messages {
 			// Convert ContentBlocks from Anthropic → Bedrock, inserting cache points
 			let mut content = Vec::with_capacity(msg.content.len() * 2);
 			for block in msg.content {
-				let (bedrock_block, has_cache_control) = match block {
+				let (bedrock_block, has_cache_control, cache_ttl) = match block {
 					messages::ContentBlock::Text(messages::ContentTextBlock {
 						text,
 						cache_control,
 						..
-					}) => (bedrock::ContentBlock::Text(text), cache_control.is_some()),
+					}) => (
+						bedrock::ContentBlock::Text(text),
+						cache_control.is_some(),
+						helpers::parse_cache_point_ttl(cache_control.as_ref().and_then(|c| c.ttl())),
+					),
 					messages::ContentBlock::Image(messages::ContentImageBlock {
 						source,
 						cache_control,
@@ -1606,6 +1616,7 @@ pub mod from_messages {
 								super::CanonicalImage::from_media_type_and_base64(media_type, data)?
 									.into_bedrock_content_block(),
 								cache_control.is_some(),
+								helpers::parse_cache_point_ttl(cache_control.as_ref().and_then(|c| c.ttl())),
 							)
 						} else {
 							return Err(AIError::UnsupportedConversion(strng::literal!(
@@ -1625,6 +1636,7 @@ pub mod from_messages {
 							input,
 						}),
 						cache_control.is_some(),
+						helpers::parse_cache_point_ttl(cache_control.as_ref().and_then(|c| c.ttl())),
 					),
 					messages::ContentBlock::ToolResult {
 						tool_use_id,
@@ -1633,6 +1645,8 @@ pub mod from_messages {
 						cache_control,
 					} => {
 						let mut has_cache_control = cache_control.is_some();
+						let mut cache_ttl =
+							helpers::parse_cache_point_ttl(cache_control.as_ref().and_then(|c| c.ttl()));
 						let bedrock_content = match tool_content {
 							messages::ToolResultContent::Text(text) => {
 								vec![bedrock::ToolResultContentBlock::Text(text)]
@@ -1646,6 +1660,9 @@ pub mod from_messages {
 										..
 									} => {
 										has_cache_control |= cache_control.is_some();
+										cache_ttl = cache_ttl.or_else(|| {
+											helpers::parse_cache_point_ttl(cache_control.as_ref().and_then(|c| c.ttl()))
+										});
 										Some(bedrock::ToolResultContentBlock::Text(text))
 									},
 									messages::ToolResultContentPart::Image {
@@ -1658,6 +1675,9 @@ pub mod from_messages {
 												super::CanonicalImage::from_media_type_and_base64(media_type, data)
 										{
 											has_cache_control |= cache_control.is_some();
+											cache_ttl = cache_ttl.or_else(|| {
+												helpers::parse_cache_point_ttl(cache_control.as_ref().and_then(|c| c.ttl()))
+											});
 											Some(bedrock::ToolResultContentBlock::Image(
 												image.into_bedrock_image_block(),
 											))
@@ -1683,6 +1703,7 @@ pub mod from_messages {
 								status,
 							}),
 							has_cache_control,
+							cache_ttl,
 						)
 					},
 					messages::ContentBlock::Thinking {
@@ -1696,6 +1717,7 @@ pub mod from_messages {
 							},
 						}),
 						false,
+						None,
 					),
 					messages::ContentBlock::WebSearchToolResult { .. } => continue,
 					messages::ContentBlock::RedactedThinking { .. } => continue,
@@ -1707,7 +1729,12 @@ pub mod from_messages {
 
 				content.push(bedrock_block);
 
-				helpers::maybe_insert_cache_point(&mut content, has_cache_control, &mut cache_points_used);
+				helpers::maybe_insert_cache_point(
+					&mut content,
+					has_cache_control,
+					cache_ttl,
+					&mut cache_points_used,
+				);
 			}
 
 			messages.push(bedrock::Message { role, content });
@@ -1729,11 +1756,12 @@ pub mod from_messages {
 
 		let tool_config = pending_tool_config.map(|(tools, tool_choice)| {
 			let mut bedrock_tools = Vec::with_capacity(tools.len() * 2);
-			for (tool, has_cache_control) in tools {
+			for (tool, has_cache_control, cache_ttl) in tools {
 				bedrock_tools.push(tool);
 				helpers::maybe_insert_cache_point(
 					&mut bedrock_tools,
 					has_cache_control,
+					cache_ttl,
 					&mut cache_points_used,
 				);
 			}
@@ -2439,6 +2467,7 @@ pub mod from_responses {
 						maybe_insert_cache_point(
 							&mut blocks,
 							input_text.prompt_cache_breakpoint.is_some(),
+							None,
 							cache_points_used,
 						);
 					},
@@ -2464,6 +2493,7 @@ pub mod from_responses {
 						maybe_insert_cache_point(
 							&mut blocks,
 							input_image.prompt_cache_breakpoint.is_some(),
+							None,
 							cache_points_used,
 						);
 					},
@@ -2524,6 +2554,7 @@ pub mod from_responses {
 						maybe_insert_cache_point(
 							&mut blocks,
 							input_file.prompt_cache_breakpoint.is_some(),
+							None,
 							cache_points_used,
 						);
 					},
@@ -2545,6 +2576,7 @@ pub mod from_responses {
 						maybe_insert_cache_point(
 							&mut blocks,
 							input_text.prompt_cache_breakpoint.is_some(),
+							None,
 							cache_points_used,
 						);
 					},
@@ -2769,7 +2801,7 @@ pub mod from_responses {
 			};
 			if meets_minimum {
 				system.push(bedrock::SystemContentBlock::CachePoint {
-					cache_point: create_cache_point(),
+					cache_point: create_cache_point(None),
 				});
 				cache_points_used += 1;
 			}
@@ -2860,7 +2892,7 @@ pub mod from_responses {
 			{
 				tool_config
 					.tools
-					.push(bedrock::Tool::CachePoint(create_cache_point()));
+					.push(bedrock::Tool::CachePoint(create_cache_point(None)));
 			}
 		}
 		ensure_tool_config_for_history(&mut bedrock_request);
@@ -3467,9 +3499,40 @@ mod helpers {
 		}
 	}
 
-	pub fn create_cache_point() -> bedrock::CachePointBlock {
+	const PROMPT_CACHE_TTL_ENV: &str = "AGENTGATEWAY_BEDROCK_PROMPT_CACHE_TTL";
+
+	static DEFAULT_PROMPT_CACHE_TTL: LazyLock<Option<bedrock::CachePointTtl>> = LazyLock::new(|| {
+		let Ok(env) = std::env::var(PROMPT_CACHE_TTL_ENV) else {
+			return None;
+		};
+		let ttl = parse_cache_point_ttl(Some(env.trim()));
+		if ttl.is_none() {
+			tracing::warn!(
+				"{PROMPT_CACHE_TTL_ENV}={env:?} is not a recognized cache TTL (\"5m\" or \"1h\"), ignoring"
+			);
+		}
+		ttl
+	});
+
+	pub fn create_cache_point(ttl: Option<bedrock::CachePointTtl>) -> bedrock::CachePointBlock {
 		bedrock::CachePointBlock {
 			r#type: bedrock::CachePointType::Default,
+			// A client-specified ttl always wins; the env var only fills in when
+			// nothing more specific was given (client didn't set one, or this is a
+			// gateway-auto-inserted cache point from PromptCachingConfig).
+			ttl: ttl.or(*DEFAULT_PROMPT_CACHE_TTL),
+		}
+	}
+
+	/// Parse a client-supplied `cache_control.ttl` string ("5m" / "1h") into the
+	/// Bedrock wire value. An absent or unrecognized value returns `None`, which
+	/// omits the field and falls back to Bedrock's own default (5 minutes) -
+	/// Bedrock validates which models accept "1h", the gateway doesn't guess.
+	pub fn parse_cache_point_ttl(ttl: Option<&str>) -> Option<bedrock::CachePointTtl> {
+		match ttl {
+			Some("1h") => Some(bedrock::CachePointTtl::OneHour),
+			Some("5m") => Some(bedrock::CachePointTtl::FiveMinutes),
+			_ => None,
 		}
 	}
 
@@ -3498,12 +3561,13 @@ mod helpers {
 	pub fn maybe_insert_cache_point(
 		target: &mut impl CachePointTarget,
 		marked: bool,
+		ttl: Option<bedrock::CachePointTtl>,
 		cache_points_used: &mut usize,
 	) {
 		if !marked || *cache_points_used >= 4 {
 			return;
 		}
-		target.push_cache_point(create_cache_point());
+		target.push_cache_point(create_cache_point(ttl));
 		*cache_points_used += 1;
 	}
 
@@ -3572,7 +3636,7 @@ mod helpers {
 		}
 		messages[target_idx]
 			.content
-			.push(bedrock::ContentBlock::CachePoint(create_cache_point()));
+			.push(bedrock::ContentBlock::CachePoint(create_cache_point(None)));
 
 		tracing::debug!(
 			"Inserted cachePoint in message at index {} (offset={})",
