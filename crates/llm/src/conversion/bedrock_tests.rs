@@ -2766,3 +2766,287 @@ fn consecutive_mid_conversation_system_messages_merge() {
 		.collect();
 	assert_eq!(texts, vec!["hello", "reminder A", "reminder B", "world"]);
 }
+
+#[test]
+fn mid_conversation_system_with_cache_control_after_tool_result_and_cap_exhausted() {
+	use types::messages::typed as messages;
+
+	let provider = mid_system_test_provider();
+
+	fn ephemeral() -> Option<messages::CacheControlEphemeral> {
+		Some(messages::CacheControlEphemeral::Ephemeral { ttl: None })
+	}
+
+	// 4 cache_control markers land before the mid-conversation system
+	// message is even reached (leading system + 3 in the first user
+	// message), so the cap is already exhausted by the time the trailing
+	// system message's own cache_control is considered.
+	let req = mid_system_base_request(
+		vec![
+			messages::Message {
+				role: messages::Role::User,
+				content: vec![
+					messages::ContentBlock::Text(messages::ContentTextBlock {
+						text: "u1a".to_string(),
+						citations: None,
+						cache_control: ephemeral(),
+					}),
+					messages::ContentBlock::Text(messages::ContentTextBlock {
+						text: "u1b".to_string(),
+						citations: None,
+						cache_control: ephemeral(),
+					}),
+					messages::ContentBlock::Text(messages::ContentTextBlock {
+						text: "u1c".to_string(),
+						citations: None,
+						cache_control: ephemeral(),
+					}),
+				],
+			},
+			messages::Message {
+				role: messages::Role::Assistant,
+				content: vec![messages::ContentBlock::ToolUse {
+					id: "tool_1".to_string(),
+					name: "bash".to_string(),
+					input: serde_json::json!({"cmd": "ls"}),
+					cache_control: None,
+				}],
+			},
+			messages::Message {
+				role: messages::Role::User,
+				content: vec![messages::ContentBlock::ToolResult {
+					tool_use_id: "tool_1".to_string(),
+					content: messages::ToolResultContent::Text("file1\nfile2".to_string()),
+					cache_control: None,
+					is_error: None,
+				}],
+			},
+			messages::Message {
+				role: messages::Role::System,
+				content: vec![messages::ContentBlock::Text(messages::ContentTextBlock {
+					text: "<system-reminder>reminder</system-reminder>".to_string(),
+					citations: None,
+					cache_control: ephemeral(),
+				})],
+			},
+		],
+		Some(messages::SystemPrompt::Blocks(vec![
+			messages::SystemContentBlock::Text {
+				text: "leading".to_string(),
+				cache_control: ephemeral(),
+			},
+		])),
+	);
+
+	let (out, _) = super::from_messages::translate_internal(req, &provider, None).unwrap();
+
+	let total_cache_points: usize = out
+		.system
+		.as_ref()
+		.map(|s| {
+			s.iter()
+				.filter(|b| matches!(b, types::bedrock::SystemContentBlock::CachePoint { .. }))
+				.count()
+		})
+		.unwrap_or(0)
+		+ out
+			.messages
+			.iter()
+			.flat_map(|m| m.content.iter())
+			.filter(|b| matches!(b, types::bedrock::ContentBlock::CachePoint(_)))
+			.count();
+	assert_eq!(
+		total_cache_points, 4,
+		"the cap must hold at 4 even though the trailing system message also carries cache_control"
+	);
+
+	// The reminder text must still land in place (after the ToolResult),
+	// not fall back to top-level `system`, regardless of the cap.
+	assert_eq!(out.messages.len(), 3);
+	let tool_result_content = &out.messages[2].content;
+	assert_eq!(tool_result_content.len(), 2);
+	assert!(matches!(
+		&tool_result_content[0],
+		types::bedrock::ContentBlock::ToolResult(_)
+	));
+	assert!(matches!(
+		&tool_result_content[1],
+		types::bedrock::ContentBlock::Text(text) if text.contains("reminder")
+	));
+}
+
+#[test]
+fn tool_result_array_content_with_mixed_ttl_first_wins() {
+	use types::messages::typed as messages;
+
+	let provider = mid_system_test_provider();
+
+	fn ephemeral(ttl: Option<&str>) -> Option<messages::CacheControlEphemeral> {
+		Some(messages::CacheControlEphemeral::Ephemeral {
+			ttl: ttl.map(str::to_string),
+		})
+	}
+
+	// Two parts carry conflicting ttls ("1h" then "5m"). Current behavior
+	// (bedrock.rs's `cache_ttl.or_else(...)` chain) is first-wins: the
+	// first part's ttl is kept and the second is silently ignored. This
+	// pins that behavior rather than asserting a documented precedence
+	// rule, since Anthropic's Messages API doesn't specify one either.
+	let req = mid_system_base_request(
+		vec![messages::Message {
+			role: messages::Role::User,
+			content: vec![messages::ContentBlock::ToolResult {
+				tool_use_id: "tool_1".to_string(),
+				content: messages::ToolResultContent::Array(vec![
+					messages::ToolResultContentPart::Text {
+						text: "part a".to_string(),
+						citations: None,
+						cache_control: ephemeral(Some("1h")),
+					},
+					messages::ToolResultContentPart::Text {
+						text: "part b".to_string(),
+						citations: None,
+						cache_control: ephemeral(Some("5m")),
+					},
+				]),
+				cache_control: None,
+				is_error: None,
+			}],
+		}],
+		None,
+	);
+
+	let (out, _) = super::from_messages::translate_internal(req, &provider, None).unwrap();
+
+	let content = &out.messages[0].content;
+	assert_eq!(content.len(), 2, "a ToolResult block followed by one CachePoint");
+	assert!(matches!(
+		&content[0],
+		types::bedrock::ContentBlock::ToolResult(_)
+	));
+	match &content[1] {
+		types::bedrock::ContentBlock::CachePoint(cache_point) => {
+			assert_eq!(
+				cache_point.ttl,
+				Some(types::bedrock::CachePointTtl::OneHour),
+				"the first part's ttl (1h) wins over the second part's (5m)"
+			);
+		},
+		other => panic!("expected a CachePoint block, got {other:?}"),
+	}
+}
+
+#[test]
+fn empty_text_mid_conversation_system_message_with_cache_control_still_inserts_cache_point() {
+	use types::messages::typed as messages;
+
+	let provider = mid_system_test_provider();
+
+	// A mid-conversation system message with empty text but a
+	// cache_control marker: the empty text block is dropped (bedrock.rs
+	// checks `!text.is_empty()` before pushing it), but the cache point
+	// insert that follows is unconditional. This pins that a cache point
+	// still lands, appended after the preceding user message's content,
+	// with nothing of its own preceding it in that flush.
+	let req = mid_system_base_request(
+		vec![
+			messages::Message {
+				role: messages::Role::User,
+				content: vec![messages::ContentBlock::Text(messages::ContentTextBlock {
+					text: "hello".to_string(),
+					citations: None,
+					cache_control: None,
+				})],
+			},
+			messages::Message {
+				role: messages::Role::System,
+				content: vec![messages::ContentBlock::Text(messages::ContentTextBlock {
+					text: String::new(),
+					citations: None,
+					cache_control: Some(messages::CacheControlEphemeral::Ephemeral { ttl: None }),
+				})],
+			},
+		],
+		None,
+	);
+
+	let (out, _) = super::from_messages::translate_internal(req, &provider, None).unwrap();
+
+	assert_eq!(out.messages.len(), 1);
+	let content = &out.messages[0].content;
+	assert_eq!(
+		content.len(),
+		2,
+		"the empty text block must be dropped, but its cache point must still be inserted"
+	);
+	assert!(matches!(
+		&content[0],
+		types::bedrock::ContentBlock::Text(text) if text == "hello"
+	));
+	assert!(matches!(
+		&content[1],
+		types::bedrock::ContentBlock::CachePoint(_)
+	));
+}
+
+#[test]
+fn consecutive_mid_conversation_system_messages_with_cache_control_each_get_own_point() {
+	use types::messages::typed as messages;
+
+	let provider = mid_system_test_provider();
+
+	fn sys_with_cache(text: &str) -> messages::Message {
+		messages::Message {
+			role: messages::Role::System,
+			content: vec![messages::ContentBlock::Text(messages::ContentTextBlock {
+				text: text.to_string(),
+				citations: None,
+				cache_control: Some(messages::CacheControlEphemeral::Ephemeral { ttl: None }),
+			})],
+		}
+	}
+	fn user(text: &str) -> messages::Message {
+		messages::Message {
+			role: messages::Role::User,
+			content: vec![messages::ContentBlock::Text(messages::ContentTextBlock {
+				text: text.to_string(),
+				citations: None,
+				cache_control: None,
+			})],
+		}
+	}
+
+	let req = mid_system_base_request(
+		vec![
+			user("hello"),
+			sys_with_cache("reminder A"),
+			sys_with_cache("reminder B"),
+		],
+		None,
+	);
+
+	let (out, _) = super::from_messages::translate_internal(req, &provider, None).unwrap();
+
+	assert_eq!(out.messages.len(), 1);
+	let content = &out.messages[0].content;
+	// Each cache_control-marked system message gets its own cache point,
+	// immediately after its own text block, rather than being deduplicated
+	// or merged into a single trailing cache point.
+	assert_eq!(
+		content.len(),
+		5,
+		"hello, reminder A, its cache point, reminder B, its cache point"
+	);
+	let kinds: Vec<&str> = content
+		.iter()
+		.map(|b| match b {
+			types::bedrock::ContentBlock::Text(_) => "text",
+			types::bedrock::ContentBlock::CachePoint(_) => "cache_point",
+			_ => "other",
+		})
+		.collect();
+	assert_eq!(
+		kinds,
+		vec!["text", "text", "cache_point", "text", "cache_point"]
+	);
+}
