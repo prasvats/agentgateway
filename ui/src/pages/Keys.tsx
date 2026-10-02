@@ -79,8 +79,7 @@ export function KeysPage() {
 	const help = useSchemaHelp();
 	const policy = (policies.apiKey ?? null) as LlmApiKeyPolicy | null;
 	const filePolicyOwned = Boolean(
-		rawConfig.data?.llm?.policies &&
-			Object.prototype.hasOwnProperty.call(rawConfig.data.llm.policies, 'apiKey')
+		rawConfig.data?.llm?.policies && Object.hasOwn(rawConfig.data.llm.policies, 'apiKey')
 	);
 	const policyReadOnly = hybrid && filePolicyOwned;
 	const [editing, setEditing] = useState<{
@@ -649,13 +648,11 @@ function KeyEditor(props: {
 			...metadataValues,
 			...(name.trim() ? { name: name.trim() } : {})
 		};
-		const nextKey = isNew
-			? keyMode === 'auto'
-				? (generatedKey.current ??= `agw_sk_${randomKey(32)}`)
-				: key
-			: replaceKey
-				? key
-				: '';
+		let nextKey = isNew || replaceKey ? key : '';
+		if (isNew && keyMode === 'auto') {
+			generatedKey.current ??= `agw_sk_${randomKey(32)}`;
+			nextKey = generatedKey.current;
+		}
 		const value: VirtualApiKey =
 			isNew || replaceKey ? { key: nextKey, metadata } : { ...props.initial, metadata };
 		if (modelAccess === 'unrestricted') delete value.allowedModels;
@@ -794,6 +791,11 @@ function KeyEditor(props: {
 					)
 				}
 			>
+				{!props.config?.config?.database ? (
+					<StatusBanner state="warn" title="Database required">
+						API key budgets require <code>config.database</code> to be configured.
+					</StatusBanner>
+				) : null}
 				<BudgetEditor budgets={budgets} apiKeyName={keyName(props.initial)} onChange={setBudgets} />
 				{submitted && invalidBudgets ? (
 					<StatusBanner state="bad" title="Invalid budgets">
@@ -933,6 +935,7 @@ function BudgetEditor(props: {
 							item => item.apiKeyName === props.apiKeyName && item.name === budget.name.trim()
 						);
 						return (
+							// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
 							<article className="api-key-budget-card" key={index}>
 								<header className="api-key-budget-card-header">
 									<div className="api-key-budget-card-title">
@@ -1273,7 +1276,10 @@ function BudgetSummary(props: {
 				const { used, fraction, level } = budgetProgress(budget, live);
 				return (
 					<Tooltip
-						key={`${budget.name}:${index}`}
+						key={`${budget.name}:${
+							// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
+							index
+						}`}
 						content={`${budgetAmountLabel(used, budget.limit.unit)} of ${budgetAmountLabel(
 							budget.limit.amount,
 							budget.limit.unit

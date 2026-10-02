@@ -15,6 +15,14 @@ pub async fn run(
 	config: Arc<Config>,
 	config_resource_store: Option<config_store::ConfigResourceStore>,
 ) -> anyhow::Result<Bound> {
+	run_with_ui_assets(config, config_resource_store, &crate::ui::EMPTY_ASSETS_DIR).await
+}
+
+pub async fn run_with_ui_assets(
+	config: Arc<Config>,
+	config_resource_store: Option<config_store::ConfigResourceStore>,
+	ui_assets: &'static include_dir::Dir<'static>,
+) -> anyhow::Result<Bound> {
 	crate::transport::tls::warn_if_key_log_enabled();
 	let (data_plane_handle, data_plane_pool) = new_data_plane_pool(config.num_worker_threads);
 
@@ -140,6 +148,7 @@ pub async fn run(
 		shutdown.trigger(),
 		drain_rx.clone(),
 		data_plane_handle.clone(),
+		ui_assets,
 	)
 	.await
 	.context("admin server starts")?;
@@ -207,7 +216,7 @@ async fn ui_url(config: &Config) -> String {
 	let Ok(contents) = local_config.read_to_string().await else {
 		return admin_url();
 	};
-	let Ok(local) = crate::serdes::yamlviajson::from_str::<serde_json::Value>(&contents) else {
+	let Ok(local) = crate::serdes::yaml::from_str::<serde_json::Value>(&contents) else {
 		return admin_url();
 	};
 	let gateway_ref = match local.pointer("/ui/gateways") {
